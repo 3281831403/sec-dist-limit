@@ -24,7 +24,19 @@ balance 是当前可用额度，events 是成功扣减的事件审计列表。
 
 from __future__ import annotations
 
+import hashlib
 from typing import Any, Mapping, Sequence
+
+
+def _is_real_int(value: Any) -> bool:
+    """Return True for genuine integers (booleans excluded)."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _require_positive_int(value: Any, name: str) -> int:
+    if not _is_real_int(value) or value <= 0:
+        raise ValueError(f"{name} must be a positive integer, got {value!r}")
+    return value
 
 
 def shard_of(key: str, shards: int) -> int:
@@ -40,7 +52,27 @@ def shard_of(key: str, shards: int) -> int:
       受影响分片上的键迁移。
     - shards 必须是正整数，否则抛 ValueError。
     """
-    raise NotImplementedError
+    _require_positive_int(shards, "shards")
+
+    # Highest-Random-Weight (rendezvous) hashing: each candidate shard is
+    # scored independently against the exact, case-sensitive key bytes and
+    # the highest score wins. Adding shard N only changes the winner when
+    # the new candidate itself out-scores all old candidates, so every moved
+    # key lands on the newly added shard and no key shuffles between old
+    # shards. sha256 is deterministic across processes (unlike built-in
+    # hash(), which is salted by PYTHONHASHSEED).
+    winner = 0
+    winner_score = -1
+    key_bytes = key.encode("utf-8")
+    for index in range(shards):
+        digest = hashlib.sha256(
+            key_bytes + b"\x00" + str(index).encode("ascii")
+        ).digest()
+        score = int.from_bytes(digest, "big")
+        if score > winner_score:
+            winner_score = score
+            winner = index
+    return winner
 
 
 def window_bounds(now: int, window: int) -> tuple:
@@ -54,7 +86,8 @@ def window_bounds(now: int, window: int) -> tuple:
     - 相邻窗口共享一个端点，但该端点上的请求只能落入右端窗口，不能同时落入
       两个窗口。
     """
-    raise NotImplementedError
+    _require_positive_int(window, "window")
+    return now - window, now
 
 
 def local_quota(total: int, shards: int, skew: int) -> int:
@@ -69,7 +102,11 @@ def local_quota(total: int, shards: int, skew: int) -> int:
     - 均权只是保守回退。存在非均权 weights 时，加权分配由 rebalance 负责；
       不能把均分结果直接用于热点分片。
     """
-    raise NotImplementedError
+    _require_positive_int(shards, "shards")
+    remainder = total - skew
+    if remainder <= 0:
+        return 0
+    return remainder // shards
 
 
 def admit(state: dict, key: str, cost: int, now: int, policy: dict) -> dict:
@@ -106,7 +143,56 @@ def admit(state: dict, key: str, cost: int, now: int, policy: dict) -> dict:
       全部保持不变。
     - 不得使用模块级全局余额，否则多个独立 state 会互相耗尽额度。
     """
-    raise NotImplementedError
+    if not _is_real_int(cost) or cost < 0:
+        raise ValueError(f"cost must be a non-negative integer, got {cost!r}")
+
+    total = policy["total"]
+    shards = policy["shards"]
+    window = policy["window"]
+    skew = policy.get("skew", 0)
+    if skew is None:
+        skew = 0
+
+    quota = local_quota(total, shards, skew)
+    balance = state["balance"]
+
+    start, end = window_bounds(now, window)
+    window_used = 0
+    for event in state.get("events") or []:
+        event_at = event["at"]
+        # Left-open, right-closed: the shared start endpoint belongs to the
+        # previous window, while the end endpoint belongs to this one, so a
+        # boundary event is counted exactly once.
+        if start < event_at <= end:
+            window_used += event["cost"]
+
+    enough_balance = balance >= cost
+    within_window_quota = window_used + cost <= quota
+
+    if not enough_balance or not within_window_quota:
+        # Atomic whole-request rejection: do not touch balance or events.
+        return {
+            "allowed": False,
+            "remaining": balance,
+            "key": key,
+            "at": now,
+        }
+
+    remaining = balance - cost
+    state["balance"] = remaining
+
+    events = state.get("events")
+    if not isinstance(events, list):
+        events = []
+        state["events"] = events
+    events.append({"at": now, "key": key, "cost": cost})
+
+    return {
+        "allowed": True,
+        "remaining": remaining,
+        "key": key,
+        "at": now,
+    }
 
 
 def rebalance(total: int, shards: int, weights: Sequence[int]) -> dict:
@@ -135,7 +221,46 @@ def rebalance(total: int, shards: int, weights: Sequence[int]) -> dict:
     - weights 长度必须等于 shards；权重全为零时退化为均权。任何权重为负、
       长度不匹配或 shards 非正时抛 ValueError。
     """
-    raise NotImplementedError
+    _require_positive_int(shards, "shards")
+    if not _is_real_int(total) or total < 0:
+        raise ValueError(f"total must be a non-negative integer, got {total!r}")
+
+    weight_list = list(weights)
+    if len(weight_list) != shards:
+        raise ValueError(
+            f"weights length {len(weight_list)} does not match shards {shards}"
+        )
+    for weight in weight_list:
+        if not _is_real_int(weight) or weight < 0:
+            raise ValueError(f"weights must be non-negative integers, got {weight!r}")
+
+    weight_sum = sum(weight_list)
+    if weight_sum == 0:
+        # All-zero weights: deterministic equal-weight fallback.
+        effective_weights = [1] * shards
+        denominator = shards
+    else:
+        effective_weights = weight_list
+        denominator = weight_sum
+
+    # Integer-only largest-remainder (Hamilton) allocation. The fractional
+    # part of total * w / denominator is remainder / denominator; all terms
+    # share the same denominator, so comparing raw remainders is exact and
+    # avoids floating-point tie/rounding hazards.
+    floors = [(total * weight) // denominator for weight in effective_weights]
+    numerator_remainders = [
+        (total * weight) % denominator for weight in effective_weights
+    ]
+
+    leftover = total - sum(floors)
+    order = sorted(
+        range(shards),
+        key=lambda index: (-numerator_remainders[index], index),
+    )
+    for position in range(leftover):
+        floors[order[position]] += 1
+
+    return {index: floors[index] for index in range(shards)}
 
 
 def clock_skew_ok(remote_now: int, local_now: int, max_skew: int) -> bool:
@@ -149,7 +274,9 @@ def clock_skew_ok(remote_now: int, local_now: int, max_skew: int) -> bool:
     - max_skew 为负时按 0 处理，不得把负上限解释成无限宽松。
     - 本函数只回答是否可参与统计；超限分片不得把额度汇总进全局。
     """
-    raise NotImplementedError
+    if max_skew < 0:
+        max_skew = 0
+    return abs(remote_now - local_now) <= max_skew
 
 
 def validate_policy(policy: Mapping[str, Any]) -> list[str]:
@@ -168,7 +295,25 @@ def validate_policy(policy: Mapping[str, Any]) -> list[str]:
     同一策略可能同时有多个问题，结果顺序必须是 shards_missing、
     window_zero、max_skew_too_large。
     """
-    raise NotImplementedError
+    problems: list[str] = []
+
+    shards = policy.get("shards")
+    if not _is_real_int(shards) or shards < 1:
+        problems.append("shards_missing")
+
+    window = policy.get("window")
+    window_invalid = not _is_real_int(window) or window < 1
+    if window_invalid:
+        problems.append("window_zero")
+
+    max_skew = policy.get("max_skew", 0)
+    # Compare only well-formed integers so malformed policies produce problem
+    # codes instead of raising TypeError; a zero/invalid window is still
+    # compared arithmetically (e.g. skew 61 against window 0).
+    if _is_real_int(max_skew) and _is_real_int(window) and max_skew > window:
+        problems.append("max_skew_too_large")
+
+    return problems
 
 
 def quota_batch(requests: Sequence[Mapping[str, Any]], policy: dict, now: int) -> dict:
@@ -198,4 +343,14 @@ def quota_batch(requests: Sequence[Mapping[str, Any]], policy: dict, now: int) -
     - 两批独立调用互不影响，不得留下模块级或闭包级的跨批状态；不修改
       requests 与 policy。
     """
-    raise NotImplementedError
+    results: dict = {}
+    for request in requests:
+        # A brand-new, request-private state for every key: no balance or
+        # event list is ever shared between keys or between batches.
+        state = {"balance": request["balance"], "events": []}
+        decision = admit(state, request["key"], request["cost"], now, policy)
+        results[request["key"]] = {
+            "allowed": decision["allowed"],
+            "remaining": decision["remaining"],
+        }
+    return results
